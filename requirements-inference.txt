@@ -1,0 +1,5 @@
+torch
+transformers
+accelerate
+pillow
+qwen-vl-utils
