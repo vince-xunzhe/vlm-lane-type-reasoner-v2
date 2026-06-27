@@ -210,6 +210,14 @@ def score_summary(decision: dict[str, Any]) -> str:
     return ", ".join(parts) if parts else "no special score"
 
 
+def is_special_lane(lane_decision: dict[str, Any]) -> bool:
+    return str(lane_decision.get("lane_type") or "normal") != "normal"
+
+
+def has_special_lane(decision: dict[str, Any]) -> bool:
+    return any(is_special_lane(item) for item in decision.get("lane_decisions") or [])
+
+
 def evidence_summary(decision: dict[str, Any], max_items: int = 3) -> str:
     accepted = [item for item in decision.get("evidence") or [] if item.get("accepted")]
     if not accepted:
@@ -356,14 +364,42 @@ def render_frame(decision_path: Path, output_dir: Path, args: argparse.Namespace
     draw_text_box_clamped(draw, (10, 10), header, font, image_size, bg=(15, 23, 42), fill=(255, 255, 255), padding=6)
     draw_panel(draw, (image.width, 0), (args.panel_width, image.height), decision, font, small_font)
 
-    output_path = output_dir / "overlay" / f"{decision.get('frame')}.jpg"
+    frame = str(decision.get("frame"))
+    output_path = output_dir / "overlay" / f"{frame}.jpg"
+    major_output_path = output_dir / "major" / f"{frame}.jpg"
+    special_lane = has_special_lane(decision)
     if args.dry_run:
-        return {"frame": decision.get("frame"), "output": str(output_path), "dry_run": True}
-    if output_path.exists() and not args.overwrite:
-        return {"frame": decision.get("frame"), "output": str(output_path), "saved": False, "reason": "exists"}
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    canvas.save(output_path, quality=int(clamp(args.quality, 1, 100)))
-    return {"frame": decision.get("frame"), "output": str(output_path), "saved": True}
+        return {
+            "frame": frame,
+            "output": str(output_path),
+            "major_output": str(major_output_path) if special_lane else None,
+            "has_special_lane": special_lane,
+            "dry_run": True,
+        }
+
+    saved = False
+    major_saved = False
+    if not output_path.exists() or args.overwrite:
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        canvas.save(output_path, quality=int(clamp(args.quality, 1, 100)))
+        saved = True
+    if special_lane and (not major_output_path.exists() or args.overwrite):
+        major_output_path.parent.mkdir(parents=True, exist_ok=True)
+        canvas.save(major_output_path, quality=int(clamp(args.quality, 1, 100)))
+        major_saved = True
+
+    record: dict[str, Any] = {
+        "frame": frame,
+        "output": str(output_path),
+        "saved": saved,
+        "has_special_lane": special_lane,
+    }
+    if output_path.exists() and not saved:
+        record["reason"] = "exists"
+    if special_lane:
+        record["major_output"] = str(major_output_path)
+        record["major_saved"] = major_saved
+    return record
 
 
 def write_index(output_dir: Path, records: list[dict[str, Any]]) -> None:
@@ -398,6 +434,40 @@ def write_index(output_dir: Path, records: list[dict[str, Any]]) -> None:
     (output_dir / "index.html").write_text(html_text, encoding="utf-8")
 
 
+def write_major_index(output_dir: Path, records: list[dict[str, Any]]) -> None:
+    major_dir = output_dir / "major"
+    figures = []
+    for record in records:
+        output = record.get("major_output")
+        if not output:
+            continue
+        rel = Path(output).relative_to(major_dir)
+        frame = html.escape(str(record.get("frame")))
+        figures.append(f"<figure><a href='{html.escape(str(rel))}'><img src='{html.escape(str(rel))}'></a><figcaption>{frame}</figcaption></figure>")
+    html_text = f"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Major Lane Decision Visualization</title>
+  <style>
+    body {{ margin: 24px; font-family: Arial, sans-serif; background: #0f172a; color: #e2e8f0; }}
+    .grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(480px, 1fr)); gap: 16px; }}
+    figure {{ margin: 0; background: #111827; padding: 10px; border-radius: 8px; }}
+    img {{ width: 100%; height: auto; display: block; }}
+    figcaption {{ margin-top: 8px; color: #94a3b8; }}
+  </style>
+</head>
+<body>
+  <h1>Major Lane Decision Visualization</h1>
+  <p>Generated at {html.escape(utc_now())}. Frames here contain at least one non-normal lane decision.</p>
+  <div class="grid">{''.join(figures)}</div>
+</body>
+</html>
+"""
+    major_dir.mkdir(parents=True, exist_ok=True)
+    (major_dir / "index.html").write_text(html_text, encoding="utf-8")
+
+
 def main() -> int:
     args = parse_args()
     ensure_dependencies()
@@ -425,11 +495,14 @@ def main() -> int:
         "output_dir": str(output_dir),
         "frame_count": len(paths),
         "ok_count": sum(1 for item in records if not item.get("error")),
+        "major_count": sum(1 for item in records if item.get("has_special_lane") and not item.get("error")),
         "records": records,
     }
     if not args.dry_run:
         dump_json(output_dir / "_summary.json", summary)
+        dump_json(output_dir / "major" / "_summary.json", {**summary, "records": [item for item in records if item.get("has_special_lane")]})
         write_index(output_dir, records)
+        write_major_index(output_dir, records)
     else:
         print(json.dumps(summary, ensure_ascii=False, indent=2))
     print(f"[done] rendered={summary['ok_count']} output={output_dir}")
