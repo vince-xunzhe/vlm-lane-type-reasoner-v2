@@ -43,6 +43,7 @@ VARIABLE_WORDS = {"可", "变"}
 BUS_WORDS = {"公", "交"}
 
 BUS_LABELS = {"bus_icon", "bus_related_time_restriction_sign", "bus_sign"}
+BUS_RIGHTMOST_SIGN_LABELS = {"bus_related_time_restriction_sign", "bus_sign"}
 BICYCLE_LABELS = {"bicycle_icon", "bicycle_sign"}
 INVALID_SIGNAL_LABELS = {"variable_lane_signal", "red_x"}
 
@@ -111,9 +112,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--dry-run", "--dry_run", action="store_true")
     parser.add_argument("--min-road-score", "--min_road_score", type=float, default=0.35)
+    parser.add_argument("--min-road-raw-score", "--min_road_raw_score", type=float, default=0.12)
     parser.add_argument("--min-road-inside-fraction", "--min_road_inside_fraction", type=float, default=0.20)
+    parser.add_argument("--min-road-object-quality", "--min_road_object_quality", type=float, default=0.35)
     parser.add_argument("--min-sign-score", "--min_sign_score", type=float, default=0.50)
     parser.add_argument("--min-sign-margin", "--min_sign_margin", type=float, default=0.0)
+    parser.add_argument("--min-sign-object-quality", "--min_sign_object_quality", type=float, default=0.30)
+    parser.add_argument("--min-rightmost-bus-sign-score", "--min_rightmost_bus_sign_score", type=float, default=0.45)
+    parser.add_argument("--min-rightmost-bus-sign-raw-score", "--min_rightmost_bus_sign_raw_score", type=float, default=0.75)
+    parser.add_argument("--max-small-sign-z-extrapolation-m", "--max_small_sign_z_extrapolation_m", type=float, default=25.0)
+    parser.add_argument("--min-boundary-position-confidence", "--min_boundary_position_confidence", type=float, default=0.35)
     parser.add_argument("--tie-margin", "--tie_margin", type=float, default=1.0)
     return parser.parse_args()
 
@@ -171,6 +179,39 @@ def safe_float(value: Any, default: float = 0.0) -> float:
     return out if math.isfinite(out) else default
 
 
+def clamp(value: float, low: float, high: float) -> float:
+    return max(low, min(high, value))
+
+
+def object_quality_score(obj: dict[str, Any], default: float = 1.0) -> float:
+    quality = obj.get("object_quality") or {}
+    return safe_float(quality.get("score"), default=default)
+
+
+def object_quality_flags(obj: dict[str, Any]) -> set[str]:
+    quality = obj.get("object_quality") or {}
+    return {str(item) for item in quality.get("flags") or []}
+
+
+def score_item_raw(score_item: dict[str, Any] | None) -> float:
+    return safe_float((score_item or {}).get("raw_score"))
+
+
+def score_item_z_extrapolation(score_item: dict[str, Any] | None) -> float:
+    return safe_float((score_item or {}).get("z_extrapolation_m"))
+
+
+def score_item_lane_reliability(score_item: dict[str, Any] | None) -> float:
+    return safe_float((score_item or {}).get("lane_bev_fit_reliability"), default=1.0)
+
+
+def score_item_rightmost_prior(score_item: dict[str, Any] | None) -> float:
+    item = score_item or {}
+    if not item.get("rightmost_prior_active"):
+        return 1.0
+    return safe_float(item.get("rightmost_prior_factor"), default=1.0)
+
+
 def score_item_for_lane(obj: dict[str, Any], lane_id: str) -> dict[str, Any] | None:
     assignment = obj.get("assignment") or {}
     scores = assignment.get("scores") or []
@@ -197,13 +238,36 @@ def accepted_top_object(obj: dict[str, Any], args: argparse.Namespace) -> tuple[
         return False, "missing_association_score", None
     kind = str(obj.get("kind") or "")
     score = safe_float(score_item.get("score"))
+    raw_score = score_item_raw(score_item)
     margin = safe_float((obj.get("assignment") or {}).get("top2_margin"))
     inside_fraction = safe_float(score_item.get("inside_fraction"))
+    quality_score = object_quality_score(obj)
+    quality_flags = object_quality_flags(obj)
+    z_extrapolation = score_item_z_extrapolation(score_item)
     if kind == "road_marking":
-        if score >= args.min_road_score or inside_fraction >= args.min_road_inside_fraction:
+        if quality_score < args.min_road_object_quality:
+            return False, "road_marking_object_quality_below_threshold", score_item
+        if label == "bicycle_icon" and "road_marking_near_bottom" in quality_flags:
+            return False, "near_bottom_bicycle_icon_filtered", score_item
+        strong_inside = inside_fraction >= args.min_road_inside_fraction and raw_score >= args.min_road_raw_score
+        strong_score = score >= args.min_road_score and raw_score >= args.min_road_raw_score * 0.75
+        if strong_inside or strong_score:
             return True, None, score_item
-        return False, "road_marking_association_below_threshold", score_item
+        return False, "road_marking_association_below_raw_or_inside_threshold", score_item
     if kind == "sign_signal":
+        small_sign = bool({"small_sign_short_side", "small_sign_area"} & quality_flags)
+        if quality_score < args.min_sign_object_quality:
+            return False, "sign_object_quality_below_threshold", score_item
+        if small_sign and z_extrapolation > args.max_small_sign_z_extrapolation_m:
+            return False, "small_far_sign_z_extrapolation_too_large", score_item
+        rightmost_prior = score_item_rightmost_prior(score_item)
+        if (
+            label in BUS_RIGHTMOST_SIGN_LABELS
+            and rightmost_prior > 1.0
+            and score >= args.min_rightmost_bus_sign_score
+            and raw_score >= args.min_rightmost_bus_sign_raw_score
+        ):
+            return True, None, score_item
         if score >= args.min_sign_score and margin >= args.min_sign_margin:
             return True, None, score_item
         return False, "sign_association_below_threshold", score_item
@@ -223,6 +287,9 @@ def collect_objects_by_lane(frame_payload: dict[str, Any], args: argparse.Namesp
             "prompt_name": obj.get("prompt_name"),
             "top_lane_id": top_lane_id,
             "top_score": safe_float(score_item.get("score")) if score_item else None,
+            "top_raw_score": score_item_raw(score_item) if score_item else None,
+            "top_z_extrapolation_m": score_item_z_extrapolation(score_item) if score_item else None,
+            "object_quality": object_quality_score(obj) if score_item else None,
             "top2_margin": safe_float((obj.get("assignment") or {}).get("top2_margin")),
             "accepted": accepted,
             "reason": reason,
@@ -236,10 +303,58 @@ def collect_objects_by_lane(frame_payload: dict[str, Any], args: argparse.Namesp
     return by_lane, rejected
 
 
+def suppress_conflicting_bus_signs(by_lane: dict[str, list[dict[str, Any]]], rejected: list[dict[str, Any]]) -> None:
+    strong_bus_lanes = set()
+    for lane_id, objects in by_lane.items():
+        labels = {str(obj.get("label_name") or "") for obj in objects}
+        if {"公", "交"}.issubset(labels) or {"bus_text_gong", "bus_text_jiao"}.issubset(labels) or "bus_icon" in labels:
+            strong_bus_lanes.add(str(lane_id))
+    if not strong_bus_lanes:
+        return
+    for lane_id, objects in list(by_lane.items()):
+        if str(lane_id) in strong_bus_lanes:
+            continue
+        kept = []
+        for obj in objects:
+            label = str(obj.get("label_name") or "")
+            score_item = obj.get("_accepted_score_item") or top_score_item(obj)
+            score = safe_float((score_item or {}).get("score"))
+            margin = safe_float((obj.get("assignment") or {}).get("top2_margin"))
+            if label in {"bus_related_time_restriction_sign", "bus_sign"} and score < 0.75 and margin < 0.40:
+                rejected.append(
+                    {
+                        "object_id": obj.get("object_id"),
+                        "label_name": label,
+                        "kind": obj.get("kind"),
+                        "prompt_name": obj.get("prompt_name"),
+                        "top_lane_id": str(lane_id),
+                        "top_score": score,
+                        "top_raw_score": score_item_raw(score_item),
+                        "top2_margin": margin,
+                        "object_quality": object_quality_score(obj),
+                        "accepted": False,
+                        "reason": "suppressed_by_strong_bus_road_marking_lane",
+                        "strong_bus_lanes": sorted(str(item) for item in strong_bus_lanes),
+                    }
+                )
+                continue
+            kept.append(obj)
+        by_lane[lane_id] = kept
+
+
 def boundary_value(lane: dict[str, Any], side: str) -> str:
     boundary = lane.get("boundary_type") or {}
     value = boundary.get(side)
     return str(value or "none")
+
+
+def boundary_position_confidence(lane: dict[str, Any]) -> float:
+    bottom_x = safe_float(lane.get("image_bottom_x"), default=-1.0)
+    image_width = safe_float(lane.get("image_width"), default=0.0)
+    if bottom_x < 0.0 or image_width <= 1.0:
+        return 1.0
+    x_norm = bottom_x / image_width
+    return clamp((x_norm - 0.22) / 0.20, 0.0, 1.0)
 
 
 def add_score(scores: dict[str, float], evidence: list[Evidence], item: Evidence) -> None:
@@ -248,16 +363,30 @@ def add_score(scores: dict[str, float], evidence: list[Evidence], item: Evidence
         scores[str(item.lane_type)] += float(item.score_delta)
 
 
-def boundary_evidence(lane: dict[str, Any], scores: dict[str, float], evidence: list[Evidence]) -> None:
+def boundary_evidence(lane: dict[str, Any], scores: dict[str, float], evidence: list[Evidence], args: argparse.Namespace) -> None:
     left = boundary_value(lane, "left")
     right = boundary_value(lane, "right")
-    details = {"left_boundary": left, "right_boundary": right}
+    position_confidence = boundary_position_confidence(lane)
+    details = {"left_boundary": left, "right_boundary": right, "position_confidence": round(position_confidence, 6)}
     if left == "double_yellow_dash" and right == "double_yellow_dash":
-        add_score(
-            scores,
-            evidence,
-            Evidence("both_double_yellow_dash", "tidal", 7.0, "boundary_type", details=details),
-        )
+        if position_confidence >= args.min_boundary_position_confidence:
+            add_score(
+                scores,
+                evidence,
+                Evidence("both_double_yellow_dash", "tidal", 7.0 * position_confidence, "boundary_type", details=details),
+            )
+        else:
+            evidence.append(
+                Evidence(
+                    "both_double_yellow_dash_low_position_confidence",
+                    None,
+                    0.0,
+                    "boundary_type",
+                    accepted=False,
+                    reason="boundary_position_confidence_below_threshold",
+                    details=details,
+                )
+            )
     elif left == "double_yellow_dash" or right == "double_yellow_dash":
         evidence.append(
             Evidence(
@@ -272,11 +401,24 @@ def boundary_evidence(lane: dict[str, Any], scores: dict[str, float], evidence: 
         )
 
     if left == "zigzag_line" and right == "zigzag_line":
-        add_score(
-            scores,
-            evidence,
-            Evidence("both_zigzag_line", "variable", 7.0, "boundary_type", details=details),
-        )
+        if position_confidence >= args.min_boundary_position_confidence:
+            add_score(
+                scores,
+                evidence,
+                Evidence("both_zigzag_line", "variable", 7.0 * position_confidence, "boundary_type", details=details),
+            )
+        else:
+            evidence.append(
+                Evidence(
+                    "both_zigzag_line_low_position_confidence",
+                    None,
+                    0.0,
+                    "boundary_type",
+                    accepted=False,
+                    reason="boundary_position_confidence_below_threshold",
+                    details=details,
+                )
+            )
     elif left == "zigzag_line" or right == "zigzag_line":
         evidence.append(
             Evidence(
@@ -295,7 +437,10 @@ def object_confidence(obj: dict[str, Any]) -> tuple[float, float]:
     score_item = obj.get("_accepted_score_item") or {}
     score = safe_float(score_item.get("score"), default=1.0)
     margin = safe_float((obj.get("assignment") or {}).get("top2_margin"))
-    return score, margin
+    quality = object_quality_score(obj)
+    lane_reliability = score_item_lane_reliability(score_item)
+    effective = score * quality * (0.75 + 0.25 * lane_reliability)
+    return effective, margin
 
 
 def add_object_rule(
@@ -320,7 +465,13 @@ def add_object_rule(
             object_id=str(obj.get("object_id") or ""),
             association_score=round(assoc_score, 6),
             top2_margin=round(margin, 6),
-            details={"base_weight": base_weight},
+            details={
+                "base_weight": base_weight,
+                "raw_association_score": safe_float((obj.get("_accepted_score_item") or {}).get("score")),
+                "raw_score": score_item_raw(obj.get("_accepted_score_item") or {}),
+                "object_quality": object_quality_score(obj),
+                "lane_bev_fit_reliability": score_item_lane_reliability(obj.get("_accepted_score_item") or {}),
+            },
         ),
     )
 
@@ -430,7 +581,7 @@ def decide_lane(
     lane_id = str(lane.get("lane_id"))
     scores = {name: 0.0 for name in SPECIAL_TYPES}
     evidence: list[Evidence] = []
-    boundary_evidence(lane, scores, evidence)
+    boundary_evidence(lane, scores, evidence, args)
     object_evidence(objects, scores, evidence)
     lane_type, reason = choose_lane_type(scores, args.tie_margin)
     full_scores = {name: round(float(scores.get(name, 0.0)), 6) for name in SPECIAL_TYPES}
@@ -459,7 +610,11 @@ def decide_lane(
                 "label_name": obj.get("label_name"),
                 "kind": obj.get("kind"),
                 "prompt_name": obj.get("prompt_name"),
-                "association_score": safe_float((obj.get("_accepted_score_item") or {}).get("score")),
+                "association_score": object_confidence(obj)[0],
+                "raw_association_score": safe_float((obj.get("_accepted_score_item") or {}).get("score")),
+                "raw_score": score_item_raw(obj.get("_accepted_score_item") or {}),
+                "object_quality": object_quality_score(obj),
+                "lane_bev_fit_reliability": score_item_lane_reliability(obj.get("_accepted_score_item") or {}),
                 "top2_margin": safe_float((obj.get("assignment") or {}).get("top2_margin")),
             }
             for obj in objects
@@ -473,6 +628,7 @@ def process_frame(path: Path, args: argparse.Namespace) -> dict[str, Any]:
     payload = load_json(path)
     frame = str(payload.get("frame") or path.stem)
     objects_by_lane, rejected = collect_objects_by_lane(payload, args)
+    suppress_conflicting_bus_signs(objects_by_lane, rejected)
     lane_decisions = []
     for lane in payload.get("lanes") or []:
         lane_id = str(lane.get("lane_id"))
@@ -581,9 +737,14 @@ def main() -> int:
         "output_dir": str(args.output_dir),
         "config": {
             "min_road_score": args.min_road_score,
+            "min_road_raw_score": args.min_road_raw_score,
             "min_road_inside_fraction": args.min_road_inside_fraction,
+            "min_road_object_quality": args.min_road_object_quality,
             "min_sign_score": args.min_sign_score,
             "min_sign_margin": args.min_sign_margin,
+            "min_sign_object_quality": args.min_sign_object_quality,
+            "max_small_sign_z_extrapolation_m": args.max_small_sign_z_extrapolation_m,
+            "min_boundary_position_confidence": args.min_boundary_position_confidence,
             "tie_margin": args.tie_margin,
             "priority": list(PRIORITY),
             "lane_type_order": list(LANE_TYPES),

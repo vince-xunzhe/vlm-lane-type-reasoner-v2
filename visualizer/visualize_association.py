@@ -295,7 +295,7 @@ def overlay_sam_mask(image: Image.Image, mask_path_value: str | None, alpha: int
 
 
 def lane_center_x_at_z(lane: dict[str, Any], z: float) -> float | None:
-    fit = lane.get("bev_fit") or {}
+    fit = lane.get("effective_bev_fit") or lane.get("bev_fit") or {}
     if not fit.get("ok"):
         return None
     try:
@@ -403,14 +403,20 @@ def draw_image_evidence(
         draw_polyline(draw, polyline, color, line_width)
         draw_lane_depth_samples(draw, lane, line_width)
         if polyline:
-            fit = lane.get("bev_fit") or {}
+            fit = lane.get("effective_bev_fit") or lane.get("bev_fit") or {}
             status = "ok" if fit.get("ok") else str(fit.get("reason") or lane.get("invalid_reason") or "invalid")
+            source = str(lane.get("effective_bev_fit_source") or "raw")
+            reliability = lane.get("bev_fit_reliability")
             depth_value = lane.get("depth_median")
             try:
                 depth_text = f"{float(depth_value):.1f}m" if depth_value is not None else "-"
             except (TypeError, ValueError):
                 depth_text = "-"
-            label = f"L{lane.get('lane_id')} z={depth_text} {status}"
+            try:
+                rel_text = f" r={float(reliability):.2f}" if reliability is not None else ""
+            except (TypeError, ValueError):
+                rel_text = ""
+            label = f"L{lane.get('lane_id')} z={depth_text} {status}/{source}{rel_text}"
             draw_text_box_clamped(draw, polyline[0], label, font, image_size, bg=color, fill=(0, 0, 0), padding=4)
 
     for obj in frame_payload.get("objects") or []:
@@ -642,7 +648,7 @@ def draw_lane_fit_bev(
         px, py = project(x, z)
         draw.ellipse((px - 4, py - 4, px + 4, py + 4), fill=color, outline=(15, 23, 42), width=1)
 
-    fit = lane.get("bev_fit") or {}
+    fit = lane.get("effective_bev_fit") or lane.get("bev_fit") or {}
     if fit.get("ok"):
         z_values = np.linspace(meta["z_min"], meta["z_max"], 80)
         fit_points = []
@@ -668,7 +674,13 @@ def draw_lane_fit_bev(
 
     label_z = samples[-1][1] if samples else meta["z_max"] * 0.5
     label_x = lane_center_x_at_z(lane, label_z) if fit.get("ok") else (samples[-1][0] if samples else 0.0)
-    label = f"L{lane.get('lane_id')} n={lane.get('depth_count', 0)}"
+    source = str(lane.get("effective_bev_fit_source") or "raw")
+    reliability = lane.get("bev_fit_reliability")
+    try:
+        rel_text = f" r={float(reliability):.2f}" if reliability is not None else ""
+    except (TypeError, ValueError):
+        rel_text = ""
+    label = f"L{lane.get('lane_id')} n={lane.get('depth_count', 0)} {source}{rel_text}"
     px, py = project(label_x or 0.0, label_z)
     draw_text_box(draw, (px + 6, py - 12), label, font, bg=color, fill=(0, 0, 0), padding=4)
 

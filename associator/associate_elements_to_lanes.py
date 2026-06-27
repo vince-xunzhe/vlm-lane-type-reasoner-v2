@@ -58,6 +58,7 @@ SIGN_SIGNAL_LABELS = {
     "red_x",
     "variable_lane_signal",
 }
+BUS_RIGHTMOST_PRIOR_LABELS = {"bus_related_time_restriction_sign", "bus_sign"}
 ROAD_MARKING_LABELS = {
     "bus_text_gong",
     "bus_text_jiao",
@@ -223,6 +224,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lane-band-distance-scale-m", "--lane_band_distance_scale_m", type=float, default=0.75)
     parser.add_argument("--lane-band-center-scale-m", "--lane_band_center_scale_m", type=float, default=2.0)
     parser.add_argument("--sign-lateral-scale-m", "--sign_lateral_scale_m", type=float, default=1.8)
+    parser.add_argument("--lane-repair-reference-threshold", "--lane_repair_reference_threshold", type=float, default=0.55)
+    parser.add_argument("--lane-repair-target-threshold", "--lane_repair_target_threshold", type=float, default=0.45)
+    parser.add_argument("--lane-repair-min-z-span-m", "--lane_repair_min_z_span_m", type=float, default=6.0)
+    parser.add_argument("--sign-rightmost-prior", "--sign_rightmost_prior", type=float, default=9.0)
+    parser.add_argument("--sign-z-extrapolation-scale-m", "--sign_z_extrapolation_scale_m", type=float, default=30.0)
     parser.add_argument("--max-ground-candidates", "--max_ground_candidates", type=int, default=220)
     return parser.parse_args()
 
@@ -284,6 +290,14 @@ def clamp(value: float, low: float, high: float) -> float:
     return max(low, min(high, value))
 
 
+def safe_float(value: Any, default: float | None = None) -> float | None:
+    try:
+        out = float(value)
+    except (TypeError, ValueError):
+        return default
+    return out if math.isfinite(out) else default
+
+
 def coord_mode(values: list[float]) -> str:
     if not values:
         return "normalized_1000"
@@ -322,6 +336,26 @@ def parse_points(value: Any) -> list[list[float]]:
         except (TypeError, ValueError):
             continue
     return points
+
+
+def lane_image_bottom_x(lane: dict[str, Any]) -> float | None:
+    points = lane.get("points") or []
+    if not points:
+        return None
+    try:
+        return float(max(points, key=lambda point: float(point[1]))[0])
+    except (TypeError, ValueError, IndexError):
+        return None
+
+
+def lane_image_top_x(lane: dict[str, Any]) -> float | None:
+    points = lane.get("points") or []
+    if not points:
+        return None
+    try:
+        return float(min(points, key=lambda point: float(point[1]))[0])
+    except (TypeError, ValueError, IndexError):
+        return None
 
 
 def image_path_for_frame(image_dir: Path, frame: str) -> Path | None:
@@ -594,6 +628,168 @@ def fit_lane_bev_profile(samples: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
+def fit_slope(fit: dict[str, Any]) -> float | None:
+    if not fit.get("ok"):
+        return None
+    if fit.get("model") == "constant_x":
+        return 0.0
+    if fit.get("model") == "linear_x_of_z":
+        return safe_float(fit.get("slope_x_per_z"))
+    return None
+
+
+def fit_x_at_z(fit: dict[str, Any], z: float) -> float | None:
+    if not fit.get("ok"):
+        return None
+    if fit.get("model") == "constant_x":
+        return safe_float(fit.get("x_const"))
+    if fit.get("model") == "linear_x_of_z":
+        slope = safe_float(fit.get("slope_x_per_z"))
+        intercept = safe_float(fit.get("intercept_x"))
+        if slope is None or intercept is None:
+            return None
+        return float(slope) * float(z) + float(intercept)
+    return None
+
+
+def fit_z_span(fit: dict[str, Any]) -> float:
+    z_min = safe_float(fit.get("z_min"))
+    z_max = safe_float(fit.get("z_max"))
+    if z_min is None or z_max is None:
+        return 0.0
+    return max(0.0, z_max - z_min)
+
+
+def lane_bev_fit_reliability(lane: dict[str, Any], args: argparse.Namespace) -> float:
+    fit = lane.get("bev_fit") or {}
+    if not fit.get("ok"):
+        return 0.0
+    depth_count = float(lane.get("depth_count") or 0.0)
+    depth_ratio = float(lane.get("depth_valid_ratio") or 0.0)
+    road_ratio = float(lane.get("road_hit_ratio") or 0.0)
+    z_span = fit_z_span(fit)
+    residual = safe_float(fit.get("residual_median_abs"), 0.0) or 0.0
+    count_score = clamp(depth_count / 36.0, 0.0, 1.0)
+    depth_score = clamp(depth_ratio / 0.55, 0.0, 1.0)
+    road_score = clamp(road_ratio / 0.55, 0.0, 1.0)
+    span_score = clamp(z_span / max(1e-3, float(args.lane_repair_min_z_span_m)), 0.0, 1.0)
+    residual_score = math.exp(-max(0.0, residual) / 0.75)
+    extension_penalty = 0.85 if lane.get("used_extension") else 1.0
+    score = (0.22 * count_score + 0.24 * depth_score + 0.18 * road_score + 0.28 * span_score + 0.08 * residual_score)
+    return float(clamp(score * extension_penalty, 0.0, 1.0))
+
+
+def median_or_default(values: list[float], default: float) -> float:
+    if not values:
+        return float(default)
+    return float(np.median(np.asarray(values, dtype=float)))
+
+
+def repair_lane_bev_profiles(lanes: list[dict[str, Any]], args: argparse.Namespace) -> None:
+    if not lanes:
+        return
+    ordered = sorted(
+        lanes,
+        key=lambda lane: (
+            lane_image_bottom_x(lane) if lane_image_bottom_x(lane) is not None else float(lane.get("index") or 0),
+            float(lane.get("index") or 0),
+        ),
+    )
+    order_by_id = {str(lane.get("lane_id")): idx for idx, lane in enumerate(ordered)}
+    for lane in ordered:
+        reliability = lane_bev_fit_reliability(lane, args)
+        lane["lane_order_left_to_right"] = order_by_id[str(lane.get("lane_id"))]
+        lane["bev_fit_reliability"] = reliability
+        lane["effective_bev_fit"] = dict(lane.get("bev_fit") or {})
+        lane["effective_bev_fit_source"] = "raw"
+
+    references = [
+        lane
+        for lane in ordered
+        if lane.get("bev_fit_reliability", 0.0) >= float(args.lane_repair_reference_threshold)
+        and (lane.get("bev_fit") or {}).get("ok")
+        and fit_z_span(lane.get("bev_fit") or {}) >= max(1.0, float(args.lane_repair_min_z_span_m))
+    ]
+    if not references:
+        return
+    z_refs = []
+    slopes = []
+    for lane in references:
+        fit = lane.get("bev_fit") or {}
+        z_min = safe_float(fit.get("z_min"))
+        z_max = safe_float(fit.get("z_max"))
+        if z_min is not None and z_max is not None:
+            z_refs.append((z_min + z_max) * 0.5)
+        slope = fit_slope(fit)
+        if slope is not None:
+            slopes.append(slope)
+    z_ref = median_or_default(z_refs, 20.0)
+    default_slope = median_or_default(slopes, 0.0)
+    widths: list[float] = []
+    for left_idx, left_lane in enumerate(references):
+        for right_lane in references[left_idx + 1 :]:
+            order_gap = abs(order_by_id[str(right_lane.get("lane_id"))] - order_by_id[str(left_lane.get("lane_id"))])
+            if order_gap <= 0:
+                continue
+            left_x = fit_x_at_z(left_lane.get("bev_fit") or {}, z_ref)
+            right_x = fit_x_at_z(right_lane.get("bev_fit") or {}, z_ref)
+            if left_x is None or right_x is None:
+                continue
+            width = abs(right_x - left_x) / float(order_gap)
+            if 1.8 <= width <= 5.8:
+                widths.append(width)
+    lane_width = median_or_default(widths, float(args.lane_band_default_width_m))
+    z_min_values = [safe_float((lane.get("bev_fit") or {}).get("z_min")) for lane in references]
+    z_max_values = [safe_float((lane.get("bev_fit") or {}).get("z_max")) for lane in references]
+    repaired_z_min = min([value for value in z_min_values if value is not None], default=max(0.0, z_ref - 15.0))
+    repaired_z_max = max([value for value in z_max_values if value is not None], default=z_ref + 15.0)
+
+    for lane in ordered:
+        raw_fit = lane.get("bev_fit") or {}
+        raw_ok = bool(raw_fit.get("ok"))
+        z_span = fit_z_span(raw_fit)
+        reliability = float(lane.get("bev_fit_reliability") or 0.0)
+        needs_repair = (
+            not raw_ok
+            or reliability < float(args.lane_repair_target_threshold)
+            or z_span < max(1.0, float(args.lane_repair_min_z_span_m))
+        )
+        if not needs_repair:
+            continue
+        lane_order = order_by_id[str(lane.get("lane_id"))]
+        reference = min(references, key=lambda item: abs(order_by_id[str(item.get("lane_id"))] - lane_order))
+        reference_fit = reference.get("effective_bev_fit") or reference.get("bev_fit") or {}
+        reference_order = order_by_id[str(reference.get("lane_id"))]
+        steps = lane_order - reference_order
+        reference_x = fit_x_at_z(reference_fit, z_ref)
+        if reference_x is None:
+            continue
+        slope = fit_slope(reference_fit)
+        if slope is None:
+            slope = default_slope
+        repaired_x = reference_x + float(steps) * lane_width
+        repaired_fit = {
+            "ok": True,
+            "model": "linear_x_of_z",
+            "slope_x_per_z": float(slope),
+            "intercept_x": float(repaired_x - float(slope) * z_ref),
+            "z_min": float(repaired_z_min),
+            "z_max": float(repaired_z_max),
+            "sample_count": int(lane.get("depth_count") or 0),
+            "repair_reference_lane_id": str(reference.get("lane_id")),
+            "repair_reference_order": int(reference_order),
+            "repair_target_order": int(lane_order),
+            "repair_order_steps": int(steps),
+            "repair_lane_width_m": float(lane_width),
+            "repair_z_ref_m": float(z_ref),
+            "raw_reliability": float(reliability),
+            "raw_z_span_m": float(z_span),
+            "raw_fit": raw_fit,
+        }
+        lane["effective_bev_fit"] = repaired_fit
+        lane["effective_bev_fit_source"] = "neighbor_prior_repair"
+
+
 def lane_depth_profile(scene: DepthScene, lane: dict[str, Any], boundary_type: dict[str, Any] | None, args: argparse.Namespace) -> dict[str, Any]:
     base_samples = sample_polyline(lane["points"], args.lane_samples)
     extension_attempts: list[dict[str, Any]] = []
@@ -657,6 +853,10 @@ def lane_depth_profile(scene: DepthScene, lane: dict[str, Any], boundary_type: d
         "attribute": lane.get("attribute"),
         "boundary_type": boundary_type,
         "points": lane["points"],
+        "image_width": scene.image_width,
+        "image_height": scene.image_height,
+        "image_bottom_x": lane_image_bottom_x(lane),
+        "image_top_x": lane_image_top_x(lane),
         "sampling_policy": "centerline_exact_then_forward_extension_then_ego_extension",
         "sample_count": len(samples),
         "road_hit_count": road_hits,
@@ -677,14 +877,10 @@ def lane_depth_profile(scene: DepthScene, lane: dict[str, Any], boundary_type: d
 
 
 def lane_center_x_at_z(lane: dict[str, Any], z: float) -> float | None:
-    fit = lane.get("bev_fit") or {}
+    fit = lane.get("effective_bev_fit") or lane.get("bev_fit") or {}
     if not fit.get("ok"):
         return None
-    if fit.get("model") == "constant_x":
-        return float(fit["x_const"])
-    if fit.get("model") == "linear_x_of_z":
-        return float(fit["slope_x_per_z"]) * float(z) + float(fit["intercept_x"])
-    return None
+    return fit_x_at_z(fit, z)
 
 
 def lane_bands_at_z(lanes: list[dict[str, Any]], z: float, default_width_m: float) -> list[dict[str, Any]]:
@@ -766,6 +962,74 @@ def object_depth_anchor(scene: DepthScene, obj: dict[str, Any], body_depth: dict
     }
 
 
+def object_quality(scene: DepthScene, obj: dict[str, Any], kind: str, body_depth: dict[str, Any]) -> dict[str, Any]:
+    x1, y1, x2, y2 = [float(v) for v in obj["bbox"]]
+    width = max(0.0, x2 - x1)
+    height = max(0.0, y2 - y1)
+    area = width * height
+    image_area = max(1.0, float(scene.image_width * scene.image_height))
+    area_ratio = area / image_area
+    short_side = min(width, height)
+    long_side = max(width, height)
+    touch_border = []
+    border_px = 2.0
+    if x1 <= border_px:
+        touch_border.append("left")
+    if y1 <= border_px:
+        touch_border.append("top")
+    if x2 >= scene.image_width - 1 - border_px:
+        touch_border.append("right")
+    if y2 >= scene.image_height - 1 - border_px:
+        touch_border.append("bottom")
+    near_bottom = y2 >= scene.image_height * 0.96
+    depth_valid_ratio = float(body_depth.get("valid_ratio") or 0.0)
+    depth_iqr = None
+    if body_depth.get("ok") and body_depth.get("depth_p25") is not None and body_depth.get("depth_p75") is not None:
+        depth_iqr = float(body_depth["depth_p75"]) - float(body_depth["depth_p25"])
+    score = 1.0
+    if kind == "sign_signal":
+        score *= clamp(short_side / 42.0, 0.0, 1.0)
+        score *= clamp(area_ratio / 0.0012, 0.0, 1.0)
+        if touch_border:
+            score *= 0.88
+    elif kind == "road_marking":
+        score *= clamp(short_side / 14.0, 0.0, 1.0)
+        score *= clamp(area_ratio / 0.00045, 0.0, 1.0)
+        if near_bottom or "bottom" in touch_border:
+            score *= 0.55
+    else:
+        score *= clamp(short_side / 20.0, 0.0, 1.0)
+    score *= clamp(depth_valid_ratio / 0.30, 0.0, 1.0) if body_depth.get("ok") else 0.25
+    if depth_iqr is not None and body_depth.get("depth_median"):
+        depth_median = max(1e-3, float(body_depth["depth_median"]))
+        relative_iqr = depth_iqr / depth_median
+        if relative_iqr > 0.45:
+            score *= 0.75
+    flags = []
+    if kind == "sign_signal" and short_side < 30:
+        flags.append("small_sign_short_side")
+    if kind == "sign_signal" and area_ratio < 0.001:
+        flags.append("small_sign_area")
+    if kind == "road_marking" and near_bottom:
+        flags.append("road_marking_near_bottom")
+    if touch_border:
+        flags.append("bbox_touches_border")
+    return {
+        "score": float(clamp(score, 0.0, 1.0)),
+        "bbox_width_px": float(width),
+        "bbox_height_px": float(height),
+        "bbox_short_side_px": float(short_side),
+        "bbox_long_side_px": float(long_side),
+        "bbox_area_ratio": float(area_ratio),
+        "touch_border": touch_border,
+        "truncated": bool(touch_border),
+        "near_bottom": bool(near_bottom),
+        "depth_valid_ratio": float(depth_valid_ratio),
+        "depth_iqr_m": float(depth_iqr) if depth_iqr is not None else None,
+        "flags": flags,
+    }
+
+
 def softmax_details(details: list[dict[str, Any]], raw_scores: list[float], method: str) -> dict[str, Any]:
     total = float(sum(raw_scores))
     if total <= 0:
@@ -800,7 +1064,7 @@ def score_road_marking_to_lane_bands(candidates: list[dict[str, Any]], lanes: li
     center_scale = max(1e-3, float(args.lane_band_center_scale_m))
     default_width = max(1e-3, float(args.lane_band_default_width_m))
     for lane in lanes:
-        if not (lane.get("bev_fit") or {}).get("ok"):
+        if not (lane.get("effective_bev_fit") or lane.get("bev_fit") or {}).get("ok"):
             raw_scores.append(0.0)
             details.append({"lane_id": lane["lane_id"], "raw_score": 0.0, "reason": "no_lane_bev_fit", "method": method})
             continue
@@ -860,14 +1124,16 @@ def score_road_marking_to_lane_bands(candidates: list[dict[str, Any]], lanes: li
                 "robust_band_distance": robust_band_distance,
                 "robust_center_offset": robust_center_offset,
                 "candidate_count": len(band_distances),
-                "lane_bev_fit": lane.get("bev_fit"),
+                "lane_bev_fit": lane.get("effective_bev_fit") or lane.get("bev_fit"),
+                "lane_bev_fit_source": lane.get("effective_bev_fit_source", "raw"),
+                "lane_bev_fit_reliability": lane.get("bev_fit_reliability"),
                 "band_samples_preview": preview,
             }
         )
     return softmax_details(details, raw_scores, method)
 
 
-def score_sign_bev_anchor_to_lanes(anchor: dict[str, Any], lanes: list[dict[str, Any]], args: argparse.Namespace) -> dict[str, Any]:
+def score_sign_bev_anchor_to_lanes(anchor: dict[str, Any], obj: dict[str, Any], lanes: list[dict[str, Any]], args: argparse.Namespace) -> dict[str, Any]:
     method = "sign_bev_lateral_lane_band"
     if not anchor.get("ok") or not anchor.get("xyz"):
         return {"scores": [], "reason": anchor.get("reason", "invalid_sign_anchor"), "method": method}
@@ -877,8 +1143,25 @@ def score_sign_bev_anchor_to_lanes(anchor: dict[str, Any], lanes: list[dict[str,
     details = []
     lateral_scale = max(1e-3, float(args.sign_lateral_scale_m))
     default_width = max(1e-3, float(args.lane_band_default_width_m))
+    z_extrapolation_scale = max(1e-3, float(args.sign_z_extrapolation_scale_m))
     bands = lane_bands_at_z(lanes, float(anchor_bev[1]), default_width)
     band_by_lane = {str(item["lane_id"]): item for item in bands}
+    ordered_lanes = sorted(
+        [lane for lane in lanes if lane_image_bottom_x(lane) is not None],
+        key=lambda lane: float(lane_image_bottom_x(lane) or 0.0),
+    )
+    rightmost_lane_id = str(ordered_lanes[-1].get("lane_id")) if ordered_lanes else None
+    label_name = str(obj.get("label_name") or "")
+    bbox_value = obj.get("bbox") or [0.0, 0.0, 0.0, 0.0]
+    x1, y1, x2, y2 = [float(v) for v in bbox_value]
+    center_x_norm = ((x1 + x2) * 0.5) / max(1.0, float(obj.get("image_width") or 1.0))
+    quality = obj.get("object_quality") or {}
+    touch_border = set(quality.get("touch_border") or [])
+    rightmost_prior_active = (
+        label_name in BUS_RIGHTMOST_PRIOR_LABELS
+        and rightmost_lane_id is not None
+        and (center_x_norm >= 0.52 or bool(touch_border & {"top", "right"}))
+    )
     for lane in lanes:
         band = band_by_lane.get(str(lane["lane_id"]))
         if band is None:
@@ -894,11 +1177,9 @@ def score_sign_bev_anchor_to_lanes(anchor: dict[str, Any], lanes: list[dict[str,
         center_offset = abs(anchor_x - center_x)
         center_score = math.exp(-center_offset / lateral_scale)
         band_score = 1.0 if inside else math.exp(-band_distance / lateral_scale)
-        lane_quality = min(1.0, float(lane.get("depth_valid_ratio") or 0.0) * 2.0)
-        quality_factor = 0.75 + 0.25 * lane_quality
-        raw = quality_factor * band_score * center_score
-        raw_scores.append(raw)
-        fit = lane.get("bev_fit") or {}
+        lane_quality = clamp(float(lane.get("bev_fit_reliability") or 0.0), 0.0, 1.0)
+        quality_factor = 0.65 + 0.35 * lane_quality
+        fit = lane.get("effective_bev_fit") or lane.get("bev_fit") or {}
         z_min = fit.get("z_min")
         z_max = fit.get("z_max")
         z_extrapolation = 0.0
@@ -906,6 +1187,12 @@ def score_sign_bev_anchor_to_lanes(anchor: dict[str, Any], lanes: list[dict[str,
             z_extrapolation = float(z_min) - float(anchor_bev[1])
         elif z_max is not None and float(anchor_bev[1]) > float(z_max):
             z_extrapolation = float(anchor_bev[1]) - float(z_max)
+        z_penalty = math.exp(-max(0.0, z_extrapolation - 5.0) / z_extrapolation_scale)
+        prior_factor = 1.0
+        if rightmost_prior_active and str(lane["lane_id"]) == rightmost_lane_id:
+            prior_factor = max(1.0, float(args.sign_rightmost_prior))
+        raw = quality_factor * band_score * center_score * z_penalty * prior_factor
+        raw_scores.append(raw)
         details.append(
             {
                 "lane_id": lane["lane_id"],
@@ -924,7 +1211,12 @@ def score_sign_bev_anchor_to_lanes(anchor: dict[str, Any], lanes: list[dict[str,
                 "center_score": float(center_score),
                 "band_score": float(band_score),
                 "z_extrapolation_m": float(z_extrapolation),
+                "z_penalty": float(z_penalty),
+                "rightmost_prior_active": bool(rightmost_prior_active),
+                "rightmost_prior_factor": float(prior_factor),
                 "lane_bev_fit": fit,
+                "lane_bev_fit_source": lane.get("effective_bev_fit_source", "raw"),
+                "lane_bev_fit_reliability": lane_quality,
             }
         )
     return softmax_details(details, raw_scores, method)
@@ -934,6 +1226,8 @@ def analyze_object(scene: DepthScene, obj: dict[str, Any], lane_profiles: list[d
     kind = object_kind(obj.get("label_name", ""))
     body_depth = scene.robust_depth_in_bbox(obj["bbox"])
     anchor = object_depth_anchor(scene, obj, body_depth)
+    quality = object_quality(scene, obj, kind, body_depth)
+    obj_for_scoring = {**obj, "object_quality": quality, "image_width": scene.image_width, "image_height": scene.image_height}
     filtered = False
     filter_reason = None
     if obj.get("label_name") in ALWAYS_FILTER_LABELS:
@@ -951,6 +1245,7 @@ def analyze_object(scene: DepthScene, obj: dict[str, Any], lane_profiles: list[d
         **obj,
         "kind": kind,
         "body_depth": body_depth,
+        "object_quality": quality,
         "anchor": anchor,
         "filtered": filtered,
         "filter_reason": filter_reason,
@@ -964,7 +1259,7 @@ def analyze_object(scene: DepthScene, obj: dict[str, Any], lane_profiles: list[d
         result["ground_candidate_count"] = 0
         result["ground_depth_median"] = None
         result["association_input"] = "sign_bev_depth_anchor"
-        result["assignment"] = score_sign_bev_anchor_to_lanes(anchor, lane_profiles, args)
+        result["assignment"] = score_sign_bev_anchor_to_lanes(anchor, obj_for_scoring, lane_profiles, args)
         return result
 
     candidates = sample_road_points_in_box(scene, tuple(obj["bbox"]), args.max_ground_candidates) if kind == "road_marking" else []
@@ -1027,6 +1322,7 @@ def process_frame(args: argparse.Namespace, frame: str) -> dict[str, Any]:
         lane_depth_profile(scene, lane, boundary_types.get(str(lane["lane_id"])), args)
         for lane in lanes
     ]
+    repair_lane_bev_profiles(lane_profiles, args)
     object_results = [analyze_object(scene, obj, lane_profiles, args) for obj in objects]
     result = {
         "schema_version": "camera_3d_lane_association_probe/v1-adapted",
@@ -1114,6 +1410,11 @@ def main() -> int:
             "lane_band_distance_scale_m": args.lane_band_distance_scale_m,
             "lane_band_center_scale_m": args.lane_band_center_scale_m,
             "sign_lateral_scale_m": args.sign_lateral_scale_m,
+            "lane_repair_reference_threshold": args.lane_repair_reference_threshold,
+            "lane_repair_target_threshold": args.lane_repair_target_threshold,
+            "lane_repair_min_z_span_m": args.lane_repair_min_z_span_m,
+            "sign_rightmost_prior": args.sign_rightmost_prior,
+            "sign_z_extrapolation_scale_m": args.sign_z_extrapolation_scale_m,
             "max_ground_candidates": args.max_ground_candidates,
         },
         "frame_count": len(frames),
