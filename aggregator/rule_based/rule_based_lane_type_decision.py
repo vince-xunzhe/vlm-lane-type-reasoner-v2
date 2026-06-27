@@ -354,7 +354,30 @@ def boundary_position_confidence(lane: dict[str, Any]) -> float:
     if bottom_x < 0.0 or image_width <= 1.0:
         return 1.0
     x_norm = bottom_x / image_width
-    return clamp((x_norm - 0.22) / 0.20, 0.0, 1.0)
+    base_confidence = clamp((x_norm - 0.22) / 0.20, 0.0, 1.0)
+    lane_order = safe_float(lane.get("lane_order_left_to_right"), default=-1.0)
+    fit_reliability = safe_float(lane.get("bev_fit_reliability"), default=1.0)
+    if lane_order >= 1.0 and fit_reliability >= 0.75:
+        return max(base_confidence, 0.75)
+    return base_confidence
+
+
+def boundary_confidence_details(lane: dict[str, Any], confidence: float) -> dict[str, Any]:
+    bottom_x = safe_float(lane.get("image_bottom_x"), default=-1.0)
+    image_width = safe_float(lane.get("image_width"), default=0.0)
+    x_norm = bottom_x / image_width if bottom_x >= 0.0 and image_width > 1.0 else None
+    lane_order = safe_float(lane.get("lane_order_left_to_right"), default=-1.0)
+    fit_reliability = safe_float(lane.get("bev_fit_reliability"), default=1.0)
+    details = {
+        "position_confidence": round(confidence, 6),
+        "lane_order_left_to_right": int(lane_order) if lane_order >= 0.0 else None,
+        "lane_bev_fit_reliability": round(fit_reliability, 6),
+    }
+    if x_norm is not None:
+        details["bottom_x_norm"] = round(x_norm, 6)
+    if lane_order >= 1.0 and fit_reliability >= 0.75 and confidence >= 0.75:
+        details["non_edge_high_reliability_boundary_rescue"] = True
+    return details
 
 
 def add_score(scores: dict[str, float], evidence: list[Evidence], item: Evidence) -> None:
@@ -367,7 +390,11 @@ def boundary_evidence(lane: dict[str, Any], scores: dict[str, float], evidence: 
     left = boundary_value(lane, "left")
     right = boundary_value(lane, "right")
     position_confidence = boundary_position_confidence(lane)
-    details = {"left_boundary": left, "right_boundary": right, "position_confidence": round(position_confidence, 6)}
+    details = {
+        "left_boundary": left,
+        "right_boundary": right,
+        **boundary_confidence_details(lane, position_confidence),
+    }
     if left == "double_yellow_dash" and right == "double_yellow_dash":
         if position_confidence >= args.min_boundary_position_confidence:
             add_score(
