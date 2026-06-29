@@ -640,15 +640,18 @@ def draw_lane_fit_bev(
     meta: dict[str, float],
     color: tuple[int, int, int],
     font: ImageFont.ImageFont,
-) -> None:
+) -> bool:
     samples = lane_bev_sample_points(lane)
+    fit = lane.get("effective_bev_fit") or lane.get("bev_fit") or {}
+    if not samples and not fit.get("ok"):
+        return False
+
     if len(samples) >= 2:
         draw.line([project(x, z) for x, z in samples], fill=color, width=4)
     for x, z in samples:
         px, py = project(x, z)
         draw.ellipse((px - 4, py - 4, px + 4, py + 4), fill=color, outline=(15, 23, 42), width=1)
 
-    fit = lane.get("effective_bev_fit") or lane.get("bev_fit") or {}
     if fit.get("ok"):
         z_values = np.linspace(meta["z_min"], meta["z_max"], 80)
         fit_points = []
@@ -683,19 +686,124 @@ def draw_lane_fit_bev(
     label = f"L{lane.get('lane_id')} n={lane.get('depth_count', 0)} {source}{rel_text}"
     px, py = project(label_x or 0.0, label_z)
     draw_text_box(draw, (px + 6, py - 12), label, font, bg=color, fill=(0, 0, 0), padding=4)
+    return True
+
+
+def boxes_overlap(a: tuple[int, int, int, int], b: tuple[int, int, int, int]) -> bool:
+    return not (a[2] <= b[0] or b[2] <= a[0] or a[3] <= b[1] or b[3] <= a[1])
+
+
+def place_bev_tag(
+    draw: ImageDraw.ImageDraw,
+    anchor_xy: tuple[int, int],
+    text: str,
+    font: ImageFont.ImageFont,
+    image_size: tuple[int, int],
+    occupied: list[tuple[int, int, int, int]],
+    *,
+    bg: tuple[int, int, int],
+    fill: tuple[int, int, int] = (0, 0, 0),
+) -> tuple[int, int, int, int]:
+    ax, ay = anchor_xy
+    offsets = ((12, -16), (12, 8), (-56, -16), (-56, 8), (12, -40), (-56, -40), (12, 32), (-56, 32))
+    padding = 4
+    width, height = image_size
+    bbox = text_bbox(draw, (0, 0), text, font)
+    box_w = bbox[2] - bbox[0] + padding * 2
+    box_h = bbox[3] - bbox[1] + padding * 2
+    best_xy = (ax + 12, ay - 16)
+    for dx, dy in offsets:
+        x = int(clamp(ax + dx, padding, max(padding, width - box_w - padding)))
+        y = int(clamp(ay + dy, padding, max(padding, height - box_h - padding)))
+        candidate = (x - padding, y - padding, x + box_w - padding, y + box_h - padding)
+        if not any(boxes_overlap(candidate, item) for item in occupied):
+            best_xy = (x, y)
+            break
+    tag_box = draw_text_box(draw, best_xy, text, font, bg=bg, fill=fill, padding=padding)
+    occupied.append(tag_box)
+    draw.line((ax, ay, tag_box[0], tag_box[1]), fill=bg, width=2)
+    return tag_box
+
+
+def bev_evidence_objects(frame_payload: dict[str, Any]) -> list[dict[str, Any]]:
+    out = []
+    for obj in frame_payload.get("objects") or []:
+        anchor = obj.get("anchor") or {}
+        bev = as_point(anchor.get("bev_xz"))
+        if bev is not None:
+            out.append(obj)
+    return out
+
+
+def skipped_lane_label(lane: dict[str, Any]) -> str:
+    fit = lane.get("effective_bev_fit") or lane.get("bev_fit") or {}
+    reason = str(fit.get("reason") or lane.get("invalid_reason") or "no_valid_bev_geometry")
+    return f"L{lane.get('lane_id')} n={lane.get('depth_count', 0)} {reason}"
+
+
+def evidence_panel_height(objects: list[dict[str, Any]], skipped_lanes: list[dict[str, Any]], font: ImageFont.ImageFont) -> int:
+    if not objects and not skipped_lanes:
+        return 0
+    line_count = len(objects) + len(skipped_lanes)
+    section_count = int(bool(objects)) + int(bool(skipped_lanes))
+    return 20 + section_count * 34 + line_count * (font.size + 11) + 16
+
+
+def draw_bev_evidence_panel(
+    image: Image.Image,
+    y0: int,
+    objects: list[dict[str, Any]],
+    skipped_lanes: list[dict[str, Any]],
+    font: ImageFont.ImageFont,
+    top_k: int,
+) -> None:
+    if not objects and not skipped_lanes:
+        return
+    draw = ImageDraw.Draw(image)
+    width, height = image.size
+    draw.rectangle((0, y0, width, height), fill=(11, 18, 32))
+    max_chars = max(80, int((width - 120) / 9))
+    line_y = y0 + 14
+    if objects:
+        draw.text((24, line_y), "Perception evidence", fill=(226, 232, 240), font=font)
+        line_y += 32
+        for idx, obj in enumerate(objects, 1):
+            color = object_color(obj)
+            tag = f"E{idx}"
+            draw_text_box(draw, (24, line_y), tag, font, bg=color, fill=(0, 0, 0), padding=4)
+            label = shorten(association_label(obj, top_k), max_chars)
+            draw.text((88, line_y + 2), label, fill=(226, 232, 240), font=font)
+            line_y += font.size + 11
+    if skipped_lanes:
+        if objects:
+            line_y += 8
+        draw.text((24, line_y), "Invalid lanes not drawn in BEV", fill=(226, 232, 240), font=font)
+        line_y += 32
+        for lane in skipped_lanes:
+            label = shorten(skipped_lane_label(lane), max_chars)
+            draw.text((24, line_y + 2), label, fill=(248, 113, 113), font=font)
+            line_y += font.size + 11
 
 
 def render_bev_debug(frame_payload: dict[str, Any], font: ImageFont.ImageFont, args: argparse.Namespace) -> Image.Image:
     width, height = int(args.bev_width), int(args.bev_height)
-    image = Image.new("RGB", (width, height), (15, 23, 42))
+    evidence_objects = bev_evidence_objects(frame_payload)
+    skipped_lanes: list[dict[str, Any]] = []
+    lanes = frame_payload.get("lanes") or []
+    for lane in lanes:
+        if not lane_bev_sample_points(lane) and not (lane.get("effective_bev_fit") or lane.get("bev_fit") or {}).get("ok"):
+            skipped_lanes.append(lane)
+    panel_height = evidence_panel_height(evidence_objects, skipped_lanes, font)
+    image = Image.new("RGB", (width, height + panel_height), (15, 23, 42))
     draw = ImageDraw.Draw(image)
     points = collect_bev_points(frame_payload)
     project, meta = bev_transform(points, width, height)
     draw_bev_grid(draw, project, meta, font)
-    lanes = frame_payload.get("lanes") or []
     for idx, lane in enumerate(lanes):
         draw_lane_fit_bev(draw, lane, lanes, project, meta, lane_color(idx), font)
 
+    occupied_tags: list[tuple[int, int, int, int]] = []
+    evidence_index = {id(obj): idx for idx, obj in enumerate(evidence_objects, 1)}
     for obj in frame_payload.get("objects") or []:
         color = object_color(obj)
         anchor = obj.get("anchor") or {}
@@ -704,8 +812,8 @@ def render_bev_debug(frame_payload: dict[str, Any], font: ImageFont.ImageFont, a
             px, py = project(bev[0], bev[1])
             r = 9
             draw.ellipse((px - r, py - r, px + r, py + r), fill=color, outline=(255, 255, 255), width=2)
-            label = association_label(obj, args.top_k)
-            draw_text_box_clamped(draw, (px + 12, py - 14), label, font, image.size, bg=color, fill=(0, 0, 0), padding=4)
+            tag = f"E{evidence_index.get(id(obj), 0)}"
+            place_bev_tag(draw, (px, py), tag, font, (width, height), occupied_tags, bg=color)
         for candidate in obj.get("ground_candidates_preview") or []:
             cand_bev = as_point(candidate.get("bev_xz"))
             if cand_bev is None:
@@ -717,6 +825,7 @@ def render_bev_debug(frame_payload: dict[str, Any], font: ImageFont.ImageFont, a
     draw_text_box(draw, (90, 12), title, font, bg=(30, 41, 59), fill=(255, 255, 255), padding=6)
     legend_y = height - 42
     draw.text((90, legend_y), "X: lateral meters, Z: forward depth meters. Thin colored lines are inferred lane-band edges.", fill=(203, 213, 225), font=font)
+    draw_bev_evidence_panel(image, height, evidence_objects, skipped_lanes, font, args.top_k)
     return image
 
 
